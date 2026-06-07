@@ -1,9 +1,7 @@
-# ============================================================
-#  wrangler.toml – Cấu hình Cloudflare Worker
-# ============================================================
+name = "nextcloud-webdav-cors-proxy"
+main = "index.js"
+compatibility_date = "2026-06-07"
 
-name = "proxy-vannam"
-main = "_worker.js"
-compatibility_date = "2024-05-20"
-
-# Không cần cấu hình D1 hay KV vì đây là Proxy chuyển tiếp trực tiếp
+[vars]
+# Bạn có thể cấu hình cứng Nextcloud URL ở đây nếu chỉ dùng một server duy nhất
+DEFAULT_NEXTCLOUD_URL = "https://kai.nl.tab.digital"
