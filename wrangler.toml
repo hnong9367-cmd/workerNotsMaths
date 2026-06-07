@@ -1,0 +1,9 @@
+# ============================================================
+#  wrangler.toml – Cấu hình Cloudflare Worker
+# ============================================================
+
+name = "proxy-vannam"
+main = "_worker.js"
+compatibility_date = "2024-05-20"
+
+# Không cần cấu hình D1 hay KV vì đây là Proxy chuyển tiếp trực tiếp
