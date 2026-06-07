@@ -8,7 +8,7 @@ export default {
       "Access-Control-Max-Age": "86400",
     };
 
-    // 1. Nếu là gói tin OPTIONS (Pre-flight của trình duyệt để xin phép CORS), mình trả về luôn
+    // 1. Xử lý preflight request từ trình duyệt
     if (request.method === "OPTIONS") {
       return new Response(null, {
         status: 204,
@@ -16,10 +16,9 @@ export default {
       });
     }
 
-    // 2. Chuyển đổi URL từ Worker URL sang URL của Nextcloud
     const targetUrl = new URL(request.url);
     
-    // ĐỔI DÒNG NÀY SANG DOMAIN NEXTCLOUD CỦA BẠN (Không chứa http hay dấu / ở cuối)
+    // 2. Chuyển hướng tới cấu hình Nextcloud thực tế của bạn
     targetUrl.hostname = "kai.nl.tab.digital";
 
     const newRequestInit = {
@@ -28,7 +27,7 @@ export default {
       redirect: "follow",
     };
 
-    // Forward cả Body với những request cụ thể của WebDAV
+    // 3. Giữ nguyên payload body của các phương thức WebDAV
     if (["POST", "PUT", "PATCH", "PROPFIND", "PROPPATCH", "LOCK", "MKCOL"].includes(request.method) && request.body) {
       newRequestInit.body = request.body;
     } else if (["MKCOL"].includes(request.method)) {
@@ -36,11 +35,11 @@ export default {
     }
 
     try {
-      // 3. Tiến hành gọi tới server Nextcloud thật
+      // 4. Gửi request đến Nextcloud
       const response = await fetch(targetUrl.toString(), newRequestInit);
-
-      // 4. Lấy trả lời từ Nextcloud, gắn thêm gói header CORS vào và trả lại cho ứng dụng
       const newResponse = new Response(response.body, response);
+      
+      // 5. Thêm lại các thông tin tiêu đề CORS trả về thiết bị của bản
       for (const [key, value] of Object.entries(corsHeaders)) {
         newResponse.headers.set(key, value);
       }
