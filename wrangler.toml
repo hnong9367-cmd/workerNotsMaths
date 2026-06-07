@@ -1,5 +1,5 @@
 name = "nextcloud-webdav-cors-proxy"
-main = "index.js"
+main = "_woker.js"
 compatibility_date = "2026-06-07"
 
 [vars]
