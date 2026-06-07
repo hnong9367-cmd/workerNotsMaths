@@ -1,91 +1,194 @@
-// ============================================================
-//  _worker.js – Cầu nối vạn năng Nextcloud / Tab.Digital
-//  Bỏ qua CORS & Ép buộc Sandboxing vào thư mục dataNotMaths
-// ============================================================
-
 export default {
   async fetch(request, env) {
-    // 1. XỬ LÝ CORS (OPTIONS) CHO APP CỦA BẠN
+    // 1. Cấu hình CORS để ứng dụng MathEdit trên web có quyền gọi API
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, MKCOL",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type, Depth, overwrite, destination",
+      "Access-Control-Expose-Headers": "DAV, content-length, Allow",
+    };
+
     if (request.method === "OPTIONS") {
       return new Response(null, {
         headers: {
-          "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type, Depth, Destination, Overwrite",
-          "Access-Control-Max-Age": "86400",
+          ...corsHeaders,
+          "DAV": "1, 2",
+          "Allow": "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL"
         }
       });
     }
 
-    // 2. BẮT BUỘC APP PHẢI GỬI THÔNG TIN ĐĂNG NHẬP
+    // 2. Xác thực Basic Auth (Chặn nếu sai tài khoản/chưa đăng nhập)
     const authHeader = request.headers.get("Authorization");
     if (!authHeader || !authHeader.startsWith("Basic ")) {
-      return new Response(JSON.stringify({ error: "Yêu cầu đăng nhập (Header Basic Auth bị thiếu)" }), {
-        status: 401,
-        headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
+      return new Response("Unauthorized", { 
+        status: 401, 
+        headers: { 
+          ...corsHeaders, 
+          "WWW-Authenticate": 'Basic realm="MathEdit Storage"' 
+        } 
       });
     }
 
-    // 3. GIẢI MÃ ĐỂ LẤY TÊN ĐĂNG NHẬP (USERNAME)
-    let username = "";
-    try {
-      const base64Credentials = authHeader.split(' ')[1];
-      const credentials = atob(base64Credentials);
-      username = credentials.split(':')[0]; // Lấy phần trước dấu hai chấm
-    } catch (e) {
-      return new Response(JSON.stringify({ error: "Thông tin đăng nhập bị lỗi định dạng" }), { status: 400 });
+    const base64Str = authHeader.split(" ")[1];
+    const credentials = atob(base64Str);
+    const [username, password] = credentials.split(":");
+
+    // Đọc thông tin Tài khoản & Mật khẩu từ biến môi trường của Cloudflare
+    const expectedUsername = env.USERNAME || "admin";
+    const expectedPassword = env.PASSWORD || "password";
+
+    if (username !== expectedUsername || password !== expectedPassword) {
+      return new Response("Forbidden: Sai tài khoản hoặc mật khẩu", { status: 403, headers: corsHeaders });
     }
 
-    // 4. CẤU HÌNH ĐƯỜNG DẪN ĐÍCH
-    const targetHost = "https://kai.nl.tab.digital";
-    const sandboxFolder = "dataNotMaths";
-    
     const url = new URL(request.url);
-    let safePath = url.pathname === "/" ? "" : url.pathname; 
+    let path = decodeURIComponent(url.pathname);
+    if (path.startsWith('/')) path = path.substring(1);
 
-    // Ép mọi truy cập vào đường dẫn WebDAV chuẩn của Nextcloud
-    const nextcloudDavPath = `/remote.php/dav/files/${username}/${sandboxFolder}${safePath}`;
-    const targetUrl = new URL(nextcloudDavPath + url.search, targetHost);
-
-    // 5. CHỈNH SỬA HEADERS ĐỂ ĐÁNH LỪA SERVER GỐC
-    const headers = new Headers(request.headers);
-    headers.set("Host", targetUrl.hostname);
-
-    // Xử lý riêng cho lệnh COPY/MOVE của WebDAV
-    const destinationHeader = headers.get("Destination");
-    if (destinationHeader) {
-       const destUrl = new URL(destinationHeader);
-       const destRewrite = new URL(`/remote.php/dav/files/${username}/${sandboxFolder}${destUrl.pathname}`, targetHost);
-       headers.set("Destination", destRewrite.toString());
+    // KẾT NỐI VỚI BUCKET R2 (Lưu trữ file)
+    const bucket = env.R2_BUCKET; 
+    
+    if (!bucket) {
+       return new Response("Lỗi: Chưa kết nối R2 Bucket trong cấu hình Worker", { status: 500, headers: corsHeaders });
     }
 
-    // 6. GỬI REQUEST ĐI
-    const modifiedRequest = new Request(targetUrl, {
-      method: request.method,
-      headers: headers,
-      body: request.body,
-      redirect: "follow"
-    });
-
     try {
-      const response = await fetch(modifiedRequest);
-      
-      // 7. NHẬN KẾT QUẢ, XÓA CORS CỦA SERVER GỐC VÀ TRẢ VỀ APP
-      const newResponse = new Response(response.body, response);
-      
-      newResponse.headers.set("Access-Control-Allow-Origin", "*");
-      newResponse.headers.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PROPFIND, MKCOL, COPY, MOVE");
-      newResponse.headers.set("Access-Control-Allow-Headers", "*");
-      newResponse.headers.delete("Content-Security-Policy");
-      newResponse.headers.delete("X-Frame-Options");
-      newResponse.headers.delete("X-XSS-Protection");
+      // API: TẢI FILE VỀ (GET)
+      if (request.method === "GET") {
+        const object = await bucket.get(path);
+        if (object === null) {
+          return new Response("Not Found", { status: 404, headers: corsHeaders });
+        }
+        const headers = new Headers(corsHeaders);
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        return new Response(object.body, { headers });
+      }
 
-      return newResponse;
-    } catch (error) {
-      return new Response(JSON.stringify({ error: "Lỗi kết nối tới Server gốc", detail: error.message }), { 
-        status: 502, 
-        headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" } 
-      });
+      // API: UPLOAD FILE (PUT)
+      if (request.method === "PUT") {
+        await bucket.put(path, request.body, {
+          httpMetadata: { contentType: request.headers.get("content-type") || "application/octet-stream" },
+        });
+        return new Response("Created", { status: 201, headers: corsHeaders });
+      }
+
+      // API: XOÁ FILE HOẶC THƯ MỤC (DELETE)
+      if (request.method === "DELETE") {
+        await bucket.delete(path);
+        return new Response("No Content", { status: 204, headers: corsHeaders });
+      }
+
+      // API: TẠO THƯ MỤC (MKCOL)
+      if (request.method === "MKCOL") {
+        let dirPath = path;
+        // Storage đám mây không có thư mục thật, thư mục là 1 file tĩnh kết thúc bằng "/"
+        if (!dirPath.endsWith('/')) dirPath += '/';
+        await bucket.put(dirPath, "");
+        return new Response("Created", { status: 201, headers: corsHeaders });
+      }
+
+      // API: XEM DANH SÁCH FILE VÀ THƯ MỤC (PROPFIND)
+      if (request.method === "PROPFIND") {
+        const depth = request.headers.get("Depth") || "1";
+        
+        let prefix = path === "" ? "" : path;
+        if (prefix !== "" && !prefix.endsWith('/')) prefix += '/';
+
+        let r2Objects = [];
+        let r2Prefixes = [];
+        
+        if (depth === "1") {
+            const listObj = await bucket.list({ prefix, delimiter: '/' });
+            r2Objects = listObj.objects;
+            r2Prefixes = listObj.delimitedPrefixes;
+        } else if (depth === "0") {
+            if (path === "") {
+                r2Objects = [{ key: "", size: 0, uploaded: new Date(), httpMetadata: {} }];
+            } else {
+                let dirPath = path.endsWith('/') ? path : path + '/';
+                const fileObj = await bucket.get(path);
+                const dirObj = await bucket.get(dirPath);
+                
+                if (fileObj) {
+                    r2Objects = [fileObj];
+                } else if (dirObj) {
+                    r2Objects = [dirObj];
+                } else {
+                    const childObj = await bucket.list({ prefix: dirPath, limit: 1 });
+                    if (childObj.objects.length > 0 || childObj.delimitedPrefixes.length > 0) {
+                        r2Objects = [{ key: dirPath, size: 0, uploaded: new Date(), httpMetadata: {} }];
+                    } else {
+                        return new Response("Not Found", { status: 404, headers: corsHeaders });
+                    }
+                }
+            }
+        } else {
+            return new Response("Forbidden: Không hỗ trợ quét thư mục dạng sâu", { status: 403, headers: corsHeaders });
+        }
+
+        // Tạo định dạng XML chuẩn WebDAV
+        let xml = `<?xml version="1.0" encoding="utf-8" ?>\n`;
+        xml += `<D:multistatus xmlns:D="DAV:">\n`;
+
+        if (depth === "1") {
+            xml += `  <D:response>\n`;
+            xml += `    <D:href>${url.pathname.endsWith('/') ? url.pathname : url.pathname + '/'}</D:href>\n`;
+            xml += `    <D:propstat>\n`;
+            xml += `      <D:prop>\n`;
+            xml += `        <D:resourcetype><D:collection/></D:resourcetype>\n`;
+            xml += `      </D:prop>\n`;
+            xml += `      <D:status>HTTP/1.1 200 OK</D:status>\n`;
+            xml += `    </D:propstat>\n`;
+            xml += `  </D:response>\n`;
+        }
+
+        for (const pre of r2Prefixes) {
+            xml += `  <D:response>\n`;
+            xml += `    <D:href>/${pre}</D:href>\n`;
+            xml += `    <D:propstat>\n`;
+            xml += `      <D:prop>\n`;
+            xml += `        <D:resourcetype><D:collection/></D:resourcetype>\n`;
+            xml += `      </D:prop>\n`;
+            xml += `      <D:status>HTTP/1.1 200 OK</D:status>\n`;
+            xml += `    </D:propstat>\n`;
+            xml += `  </D:response>\n`;
+        }
+
+        for (const obj of r2Objects) {
+            if (obj.key === prefix && obj.key !== "") continue;
+            let isDir = obj.key.endsWith('/');
+            let href = `/${obj.key}`;
+            
+            xml += `  <D:response>\n`;
+            xml += `    <D:href>${href}</D:href>\n`;
+            xml += `    <D:propstat>\n`;
+            xml += `      <D:prop>\n`;
+            xml += `        <D:resourcetype>${isDir ? '<D:collection/>' : ''}</D:resourcetype>\n`;
+            xml += `        <D:getcontentlength>${obj.size}</D:getcontentlength>\n`;
+            xml += `        <D:getlastmodified>${new Date(obj.uploaded).toUTCString()}</D:getlastmodified>\n`;
+            xml += `        <D:creationdate>${new Date(obj.uploaded).toISOString()}</D:creationdate>\n`;
+            xml += `      </D:prop>\n`;
+            xml += `      <D:status>HTTP/1.1 200 OK</D:status>\n`;
+            xml += `    </D:propstat>\n`;
+            xml += `  </D:response>\n`;
+        }
+
+        xml += `</D:multistatus>`;
+
+        return new Response(xml, {
+            status: 207,
+            headers: {
+                ...corsHeaders,
+                "Content-Type": "application/xml; charset=utf-8"
+            }
+        });
+      }
+
+      return new Response("Method Not Allowed", { status: 405, headers: corsHeaders });
+    } catch (e) {
+      return new Response(e.message, { status: 500, headers: corsHeaders });
     }
   }
 };
