@@ -1,194 +1,143 @@
 export default {
-  async fetch(request, env) {
-    // 1. Cấu hình CORS để ứng dụng MathEdit trên web có quyền gọi API
+  async fetch(request, env, ctx) {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
-      "Access-Control-Allow-Methods": "GET, HEAD, POST, PUT, DELETE, OPTIONS, PROPFIND, MKCOL",
-      "Access-Control-Allow-Headers": "Authorization, Content-Type, Depth, overwrite, destination",
-      "Access-Control-Expose-Headers": "DAV, content-length, Allow",
+      "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, PROPFIND, MKCOL, MOVE, COPY, PROPPATCH, OPTIONS",
+      "Access-Control-Allow-Headers": "Authorization, Content-Type, Depth, Destination, Overwrite, X-Target-Url, X-Requested-With",
+      "Access-Control-Max-Age": "86400",
     };
 
+    // Xử lý CORS Preflight (OPTIONS)
     if (request.method === "OPTIONS") {
       return new Response(null, {
-        headers: {
-          ...corsHeaders,
-          "DAV": "1, 2",
-          "Allow": "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL"
-        }
+        status: 204,
+        headers: corsHeaders,
       });
     }
 
-    // 2. Xác thực Basic Auth (Chặn nếu sai tài khoản/chưa đăng nhập)
-    const authHeader = request.headers.get("Authorization");
-    if (!authHeader || !authHeader.startsWith("Basic ")) {
-      return new Response("Unauthorized", { 
-        status: 401, 
-        headers: { 
-          ...corsHeaders, 
-          "WWW-Authenticate": 'Basic realm="MathEdit Storage"' 
-        } 
-      });
+    // Lấy URL Nextcloud đích thực tế mà client muốn gọi.
+    // Client sẽ truyền URL này thông qua Header "X-Target-Url"
+    let targetUrlString = request.headers.get("X-Target-Url");
+
+    // Nếu không truyền qua Header, kiểm tra trong Query Parameter hoặc dùng mặc định từ env
+    if (!targetUrlString) {
+      const url = new URL(request.url);
+      targetUrlString = url.searchParams.get("target");
     }
 
-    const base64Str = authHeader.split(" ")[1];
-    const credentials = atob(base64Str);
-    const [username, password] = credentials.split(":");
-
-    // Đọc thông tin Tài khoản & Mật khẩu từ biến môi trường của Cloudflare
-    const expectedUsername = env.USERNAME || "admin";
-    const expectedPassword = env.PASSWORD || "password";
-
-    if (username !== expectedUsername || password !== expectedPassword) {
-      return new Response("Forbidden: Sai tài khoản hoặc mật khẩu", { status: 403, headers: corsHeaders });
-    }
-
-    const url = new URL(request.url);
-    let path = decodeURIComponent(url.pathname);
-    if (path.startsWith('/')) path = path.substring(1);
-
-    // KẾT NỐI VỚI BUCKET R2 (Lưu trữ file)
-    const bucket = env.R2_BUCKET; 
-    
-    if (!bucket) {
-       return new Response("Lỗi: Chưa kết nối R2 Bucket trong cấu hình Worker", { status: 500, headers: corsHeaders });
+    if (!targetUrlString) {
+      // Nếu không có mốc URL nào, sử dụng mặc định
+      const defaultHost = env.DEFAULT_NEXTCLOUD_URL || "https://kai.nl.tab.digital";
+      const pathname = new URL(request.url).pathname;
+      targetUrlString = `${defaultHost.replace(/\/$/, "")}${pathname}`;
     }
 
     try {
-      // API: TẢI FILE VỀ (GET)
-      if (request.method === "GET") {
-        const object = await bucket.get(path);
-        if (object === null) {
-          return new Response("Not Found", { status: 404, headers: corsHeaders });
-        }
-        const headers = new Headers(corsHeaders);
-        object.writeHttpMetadata(headers);
-        headers.set("etag", object.httpEtag);
-        return new Response(object.body, { headers });
-      }
-
-      // API: UPLOAD FILE (PUT)
-      if (request.method === "PUT") {
-        await bucket.put(path, request.body, {
-          httpMetadata: { contentType: request.headers.get("content-type") || "application/octet-stream" },
-        });
-        return new Response("Created", { status: 201, headers: corsHeaders });
-      }
-
-      // API: XOÁ FILE HOẶC THƯ MỤC (DELETE)
-      if (request.method === "DELETE") {
-        await bucket.delete(path);
-        return new Response("No Content", { status: 204, headers: corsHeaders });
-      }
-
-      // API: TẠO THƯ MỤC (MKCOL)
-      if (request.method === "MKCOL") {
-        let dirPath = path;
-        // Storage đám mây không có thư mục thật, thư mục là 1 file tĩnh kết thúc bằng "/"
-        if (!dirPath.endsWith('/')) dirPath += '/';
-        await bucket.put(dirPath, "");
-        return new Response("Created", { status: 201, headers: corsHeaders });
-      }
-
-      // API: XEM DANH SÁCH FILE VÀ THƯ MỤC (PROPFIND)
-      if (request.method === "PROPFIND") {
-        const depth = request.headers.get("Depth") || "1";
-        
-        let prefix = path === "" ? "" : path;
-        if (prefix !== "" && !prefix.endsWith('/')) prefix += '/';
-
-        let r2Objects = [];
-        let r2Prefixes = [];
-        
-        if (depth === "1") {
-            const listObj = await bucket.list({ prefix, delimiter: '/' });
-            r2Objects = listObj.objects;
-            r2Prefixes = listObj.delimitedPrefixes;
-        } else if (depth === "0") {
-            if (path === "") {
-                r2Objects = [{ key: "", size: 0, uploaded: new Date(), httpMetadata: {} }];
-            } else {
-                let dirPath = path.endsWith('/') ? path : path + '/';
-                const fileObj = await bucket.get(path);
-                const dirObj = await bucket.get(dirPath);
-                
-                if (fileObj) {
-                    r2Objects = [fileObj];
-                } else if (dirObj) {
-                    r2Objects = [dirObj];
-                } else {
-                    const childObj = await bucket.list({ prefix: dirPath, limit: 1 });
-                    if (childObj.objects.length > 0 || childObj.delimitedPrefixes.length > 0) {
-                        r2Objects = [{ key: dirPath, size: 0, uploaded: new Date(), httpMetadata: {} }];
-                    } else {
-                        return new Response("Not Found", { status: 404, headers: corsHeaders });
-                    }
-                }
+      const targetUrl = new URL(targetUrlString);
+      
+      // Tạo một tập hợp các Header mới sạch để truyền đi
+      const newHeaders = new Headers();
+      
+      // Sao chép các header hợp lệ từ client gửi lên ngoại trừ Host và CORS headers
+      for (const [key, value] of request.headers.entries()) {
+        const lowerKey = key.toLowerCase();
+        if (
+          lowerKey !== "host" && 
+          lowerKey !== "cf-connecting-ip" && 
+          lowerKey !== "x-target-url" &&
+          !lowerKey.startsWith("cf-")
+        ) {
+          // Xử lý đặc biệt cho header Destination (trong yêu cầu MOVE/COPY)
+          // Đường dẫn đích cũng cần được ánh xạ lại từ URL Proxy về Nextcloud thực tế
+          if (lowerKey === "destination") {
+            try {
+              const destUrl = new URL(value);
+              // Nếu Destination chỉ đến Proxy, hãy đổi host thành Nextcloud đích
+              if (destUrl.host === new URL(request.url).host) {
+                // Ta phân tích đường dẫn đích thực tế từ URL Destination
+                // Ví dụ: Destination gửi qua proxy https://proxy.com/remote.php/dav... -> https://kai.nl.tab.digital/remote.php/dav...
+                const actualDest = `${targetUrl.protocol}//${targetUrl.host}${destUrl.pathname}`;
+                newHeaders.set("Destination", actualDest);
+              } else {
+                newHeaders.set("Destination", value);
+              }
+            } catch (e) {
+              newHeaders.set("Destination", value);
             }
+          } else {
+            newHeaders.set(key, value);
+          }
+        }
+      }
+
+      // Xây dựng request để gửi tới Nextcloud
+      const fetchOptions = {
+        method: request.method,
+        headers: newHeaders,
+        redirect: "follow",
+      };
+
+      // Đọc body nếu phương thức không phải GET/HEAD/OPTIONS/DELETE rỗng
+      if (request.method !== "GET" && request.method !== "HEAD" && request.method !== "OPTIONS") {
+        const contentType = request.headers.get("content-type") || "";
+        if (contentType.includes("application/json") || contentType.includes("xml") || contentType.includes("text")) {
+          fetchOptions.body = await request.text();
         } else {
-            return new Response("Forbidden: Không hỗ trợ quét thư mục dạng sâu", { status: 403, headers: corsHeaders });
+          fetchOptions.body = await request.arrayBuffer();
         }
+      }
 
-        // Tạo định dạng XML chuẩn WebDAV
-        let xml = `<?xml version="1.0" encoding="utf-8" ?>\n`;
-        xml += `<D:multistatus xmlns:D="DAV:">\n`;
+      // Gửi request thực tế tới Nextcloud
+      const response = await fetch(targetUrl.href, fetchOptions);
 
-        if (depth === "1") {
-            xml += `  <D:response>\n`;
-            xml += `    <D:href>${url.pathname.endsWith('/') ? url.pathname : url.pathname + '/'}</D:href>\n`;
-            xml += `    <D:propstat>\n`;
-            xml += `      <D:prop>\n`;
-            xml += `        <D:resourcetype><D:collection/></D:resourcetype>\n`;
-            xml += `      </D:prop>\n`;
-            xml += `      <D:status>HTTP/1.1 200 OK</D:status>\n`;
-            xml += `    </D:propstat>\n`;
-            xml += `  </D:response>\n`;
-        }
-
-        for (const pre of r2Prefixes) {
-            xml += `  <D:response>\n`;
-            xml += `    <D:href>/${pre}</D:href>\n`;
-            xml += `    <D:propstat>\n`;
-            xml += `      <D:prop>\n`;
-            xml += `        <D:resourcetype><D:collection/></D:resourcetype>\n`;
-            xml += `      </D:prop>\n`;
-            xml += `      <D:status>HTTP/1.1 200 OK</D:status>\n`;
-            xml += `    </D:propstat>\n`;
-            xml += `  </D:response>\n`;
-        }
-
-        for (const obj of r2Objects) {
-            if (obj.key === prefix && obj.key !== "") continue;
-            let isDir = obj.key.endsWith('/');
-            let href = `/${obj.key}`;
-            
-            xml += `  <D:response>\n`;
-            xml += `    <D:href>${href}</D:href>\n`;
-            xml += `    <D:propstat>\n`;
-            xml += `      <D:prop>\n`;
-            xml += `        <D:resourcetype>${isDir ? '<D:collection/>' : ''}</D:resourcetype>\n`;
-            xml += `        <D:getcontentlength>${obj.size}</D:getcontentlength>\n`;
-            xml += `        <D:getlastmodified>${new Date(obj.uploaded).toUTCString()}</D:getlastmodified>\n`;
-            xml += `        <D:creationdate>${new Date(obj.uploaded).toISOString()}</D:creationdate>\n`;
-            xml += `      </D:prop>\n`;
-            xml += `      <D:status>HTTP/1.1 200 OK</D:status>\n`;
-            xml += `    </D:propstat>\n`;
-            xml += `  </D:response>\n`;
-        }
-
-        xml += `</D:multistatus>`;
-
-        return new Response(xml, {
-            status: 207,
-            headers: {
-                ...corsHeaders,
-                "Content-Type": "application/xml; charset=utf-8"
-            }
+      // Thu thập thông tin logs gỡ lỗi khi Nextcloud phản hồi mã lỗi >= 400
+      if (!response.ok) {
+        const errorText = await response.clone().text().catch(() => "");
+        
+        // Trả lỗi chi tiết để Client dễ dàng gỡ lỗi
+        const errorHeaders = { ...corsHeaders, "Content-Type": "application/json" };
+        return new Response(JSON.stringify({
+          error: true,
+          status: response.status,
+          statusText: response.statusText,
+          method: request.method,
+          targetUrl: targetUrl.href,
+          errorMessage: errorText || "Lỗi phản hồi từ Nextcloud không có nội dung.",
+        }), {
+          status: response.status === 401 ? 401 : 400, // Nhằm kích hoạt sự kiện sai thông tin đăng nhập trên client dễ nhận biết
+          headers: errorHeaders,
         });
       }
 
-      return new Response("Method Not Allowed", { status: 405, headers: corsHeaders });
-    } catch (e) {
-      return new Response(e.message, { status: 500, headers: corsHeaders });
+      // Trả lại kết quả thành công cho Client cùng CORS Headers đầy đủ
+      const responseHeaders = new Headers(response.headers);
+      for (const [key, value] of Object.entries(corsHeaders)) {
+        responseHeaders.set(key, value);
+      }
+      
+      // Tránh lỗi bảo mật Cookie hoặc phân giải Host từ server Nextcloud
+      responseHeaders.delete("Set-Cookie");
+
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+
+    } catch (err) {
+      // Ghi log lỗi kết nối hoặc lỗi dịch vụ mạng của Cloudflare
+      const errorHeaders = { ...corsHeaders, "Content-Type": "application/json" };
+      return new Response(JSON.stringify({
+        error: true,
+        status: 502,
+        statusText: "Bad Gateway",
+        method: request.method,
+        targetUrl: targetUrlString,
+        errorMessage: `Lỗi kết nối từ Cloudflare Worker: ${err.message}`,
+      }), {
+        status: 502,
+        headers: errorHeaders,
+      });
     }
   }
 };
