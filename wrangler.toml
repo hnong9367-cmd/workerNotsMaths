@@ -1,3 +1,7 @@
 name = "nextcloud-webdav-proxy"
 main = "worker.js"
 compatibility_date = "2024-03-01"
+
+# Bạn có thể thêm biến môi trường ở đây nếu cần bảo mật tên miền Nextcloud sau này
+# [vars]
+# NEXTCLOUD_HOST = "kai.nl.tab.digital"
