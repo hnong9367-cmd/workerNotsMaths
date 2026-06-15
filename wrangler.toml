@@ -1,4 +1,4 @@
-name = "nextcloud-webdav-proxy"
+name = "wokernotmaths"
 main = "worker.js"
 compatibility_date = "2024-03-01"
 
